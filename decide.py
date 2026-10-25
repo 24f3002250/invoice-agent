@@ -215,8 +215,13 @@ async def call_llm(system: str, user: str, deadline: float | None = None) -> dic
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     base = {"model": LLM_MODEL,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-    variants = [dict(base, temperature=0, response_format={"type": "json_object"}),
-                dict(base, response_format={"type": "json_object"}),
+    try:
+        extra = json.loads(os.environ.get("LLM_EXTRA", "") or "{}")
+    except ValueError:
+        extra = {}
+    variants = [dict(base, temperature=0, response_format={"type": "json_object"}, **extra),
+                dict(base, response_format={"type": "json_object"}, **extra),
+                dict(base, **extra),
                 dict(base)]
     vi, attempt, last = 0, 0, None
     while vi < len(variants):
