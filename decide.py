@@ -41,7 +41,7 @@ LLM_API_KEY = (os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
                or os.environ.get("AIPIPE_TOKEN") or "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 LLM_CHUNK = max(1, int(os.environ.get("LLM_CHUNK", "4")))
-LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "36"))
+LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "22"))
 DECIDE_BUDGET = float(os.environ.get("DECIDE_BUDGET", "39"))
 REF_STYLE = os.environ.get("REF_STYLE", "inner")  # "inner" -> ABC-1 ; "bracketed" -> [ABC-1]
 PROMPT_VERSION = "v3"
@@ -239,8 +239,10 @@ async def call_llm(system: str, user: str, deadline: float | None = None) -> dic
                 r = await client().post(url, headers=headers, json=dict(variants[vi], model=models[mi % len(models)]),
                                         timeout=min(LLM_TIMEOUT, remaining - 1))
         except (httpx.TimeoutException, httpx.TransportError) as e:
-            last = RuntimeError(f"LLM transport error: {e!r}")
+            last = RuntimeError(f"LLM transport error ({models[mi % len(models)]}): {e!r}")
             log.warning("%s", last)
+            LAST_LLM_ERROR["error"] = str(last)
+            mi += 1  # slow or unreachable model: try the next one
             await asyncio.sleep(min(1.0 * attempt, max(0, deadline - loop.time() - 5)))
             continue
         if r.status_code == 400:
@@ -450,6 +452,21 @@ PATTERNS = [
 NEG_RE = r"\b(no|not|without|never|nor|cleared|resolved|released|completed)\b[^.;]{0,25}$"
 
 
+def text_facts(text: str) -> dict:
+    """Best-effort facts from labelled lines, used only by the fallback path."""
+    out = {}
+    m = re.search(r"(?im)^\s*(?:-\s*)?(?:vendor|supplier|payee)(?:\s*name)?\s*[:=]\s*(.+?)\s*$", text)
+    if m:
+        out["vendorName"] = m.group(1).strip().strip('"')
+    m = re.search(r"(?im)invoice\s*(?:number|no\.?|#|id)\s*[:=]?\s*([A-Z0-9][A-Z0-9/_.-]{2,})", text)
+    if m:
+        out["invoiceNumber"] = m.group(1).strip().rstrip(".")
+    m = re.search(r"(?im)(?:total|amount(?:\s*due)?|invoice\s*total)\s*[:=]\s*([A-Z]{3})\s*([0-9][0-9,]*(?:\.[0-9]+)?)", text)
+    if m:
+        out["currency"], out["amount"] = m.group(1), m.group(2)
+    return out
+
+
 def heuristic(seg: Segmented, pkg: dict) -> dict:
     best = None
     for p in seg.paras:
@@ -469,7 +486,8 @@ def heuristic(seg: Segmented, pkg: dict) -> dict:
         action, para = "request_approval", (cand[0] if cand else None)
     else:
         action, para = best[1], best[2]
-    sf = structured_facts(pkg)
+    sf = dict(text_facts(seg.text))
+    sf.update(structured_facts(pkg))
     raw = {
         "action": action,
         "decisiveParagraph": para["pid"] if para else None,
@@ -477,6 +495,7 @@ def heuristic(seg: Segmented, pkg: dict) -> dict:
         "vendorName": sf.get("vendorName", ""),
         "invoiceNumber": sf.get("invoiceNumber", ""),
         "amountMinor": sf.get("amountMinor"),
+        "amount": sf.get("amount"),
         "currency": sf.get("currency", ""),
         "reason": "Keyword review of the current, non-archival record determined this action.",
     }
@@ -487,29 +506,64 @@ def heuristic(seg: Segmented, pkg: dict) -> dict:
 _inflight: dict[str, asyncio.Future] = {}
 
 
+def _match_decisions(out, chunk):
+    decs = None
+    if isinstance(out, dict):
+        decs = out.get("decisions")
+        if decs is None:
+            for v in out.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    decs = v
+                    break
+            if decs is None and "action" in out:
+                decs = [out]
+    elif isinstance(out, list):
+        decs = out
+    if not isinstance(decs, list):
+        raise ValueError("no decisions list")
+    decs = [d for d in decs if isinstance(d, dict)]
+    found = {}
+    for d in decs:
+        raw = str(d.get("packageId", "")).strip()
+        for key, pid, pkg, seg in chunk:
+            if raw == pid or (raw and (raw.endswith(pid) or pid in raw)):
+                found.setdefault(key, d)
+                break
+    if not found and len(decs) == len(chunk):
+        for (key, *_), d in zip(chunk, decs):
+            found[key] = d
+    return found
+
+
 async def _decide_chunk(batch, chunk, store, futures, deadline=None):
-    """chunk: list of (key, pid, pkg, seg)."""
+    """chunk: list of (key, pid, pkg, seg). Re-asks the model for packages it skipped."""
     results = {}
-    try:
-        user = build_user_prompt(batch, [(pid, seg) for _, pid, _, seg in chunk])
-        out = await call_llm(SYSTEM_PROMPT, user, deadline)
-        decs = out.get("decisions") if isinstance(out, dict) else None
-        if not isinstance(decs, list):
-            raise ValueError("no decisions list")
-        by_pid = {str(d.get("packageId")): d for d in decs if isinstance(d, dict)}
-        for i, (key, pid, pkg, seg) in enumerate(chunk):
-            d = by_pid.get(pid) or (decs[i] if i < len(decs) and isinstance(decs[i], dict)
-                                    and len(decs) == len(chunk) else None)
-            if d is None:
-                continue
-            try:
-                dec = finalize(seg, pkg, d, "llm")
-                store.put_decision(key, dec)
-                results[key] = dec
-            except Exception as e:  # noqa: BLE001
-                log.warning("invalid model decision for %s: %s", pid, e)
-    except Exception as e:  # noqa: BLE001
-        log.warning("LLM chunk failed: %s", e)
+    loop = asyncio.get_running_loop()
+    deadline = deadline or (loop.time() + DECIDE_BUDGET)
+    pending = list(chunk)
+    for attempt in range(4):
+        if not pending or deadline - loop.time() < 8:
+            break
+        try:
+            user = build_user_prompt(batch, [(pid, seg) for _, pid, _, seg in pending])
+            out = await call_llm(SYSTEM_PROMPT, user, deadline)
+            found = _match_decisions(out, pending)
+            for key, pid, pkg, seg in pending:
+                d = found.get(key)
+                if d is None:
+                    continue
+                try:
+                    dec = finalize(seg, pkg, d, "llm")
+                    store.put_decision(key, dec)
+                    results[key] = dec
+                except Exception as e:  # noqa: BLE001
+                    log.warning("invalid model decision for %s: %s", pid, e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("LLM chunk failed (attempt %d): %s", attempt + 1, e)
+            await asyncio.sleep(min(1.0, max(0, deadline - loop.time() - 8)))
+        pending = [c for c in pending if c[0] not in results]
+        if pending:
+            log.warning("model left %d package(s) undecided; retrying", len(pending))
     for key, pid, pkg, seg in chunk:
         if key not in results:
             results[key] = heuristic(seg, pkg)  # not cached: a later run may retry the model
