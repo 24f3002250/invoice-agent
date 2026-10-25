@@ -42,9 +42,9 @@ LLM_API_KEY = (os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 LLM_CHUNK = max(1, int(os.environ.get("LLM_CHUNK", "4")))
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "22"))
-DECIDE_BUDGET = float(os.environ.get("DECIDE_BUDGET", "39"))
+DECIDE_BUDGET = float(os.environ.get("DECIDE_BUDGET", "34"))
 REF_STYLE = os.environ.get("REF_STYLE", "inner")  # "inner" -> ABC-1 ; "bracketed" -> [ABC-1]
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v5"
 
 
 def canonical(obj) -> str:
@@ -154,6 +154,12 @@ HOW TO READ THE DOCUMENTS:
 - Exactly one current paragraph about THIS invoice determines the action. Paragraphs that carry bracketed references are labelled <<P#>>. Pick the decisive one and copy its bracketed references exactly (normally exactly three).
 - Apply the current policy revision and its authority limits. Compare amounts carefully in the same currency.
 - If several issues truly apply, priority is: reject_duplicate > open_exception > hold_invoice > request_approval > settle_invoice.
+- Some packages instead give each fact its own paragraph starting with one reference like [R_ABC]. Then the decisive evidence is the THREE current-case records (for example the payment ledger entry, the signed instrument / order record, the vendor-master / callback / delegation record, the payment-controls record) and NOT the decoys (archive examples, training cases, previous-quarter thresholds, historical transfers for other orders, closed incidents for other suppliers, archived memos for unrelated orders, cover sheets).
+  * A ledger entry that previously settled the SAME order/invoice now submitted => reject_duplicate. If it settled a DIFFERENT order, it is not a duplicate.
+  * Order/receipt/invoice totals or units that disagree materially => open_exception.
+  * Remittance account differs from the vendor master and the callback is NOT confirmed => hold_invoice. If the callback is confirmed, there is no hold.
+  * Payable total greater than the autonomous ceiling => request_approval; otherwise, with everything reconciled, settle_invoice.
+- Never invent identifiers. If no invoice number is written anywhere in the package, return an empty string for invoiceNumber.
 
 FACTS: take vendorName, invoiceNumber, amount and currency from the CURRENT invoice in this package (not from examples). Copy names and numbers exactly as written. "amount" is the invoice total in MAJOR units as written (e.g. "12,345.50"); "amountMinor" is that total as an integer in minor units (paise/cents: x100; JPY x1). If the documents state the amount only in minor units, give it as amountMinor and set amount to null.
 
@@ -394,7 +400,53 @@ def choose_refs(seg: Segmented, para_id, llm_refs) -> list:
     return []
 
 
-def build_rationale(action: str, reason: str, refs: list) -> str:
+def evidence_snippets(seg, refs: list) -> dict:
+    """For each ref, the sentence (or paragraph) of the documents that carries it."""
+    out = {}
+    for r in refs:
+        for p in seg.paras:
+            if r in p["refs"]:
+                text = p["text"]
+                tag = f"[{r}]"
+                idx = text.find(tag)
+                start = max(text.rfind(". ", 0, idx) + 2 if text.rfind(". ", 0, idx) >= 0 else 0, 0)
+                if text.startswith(tag) or idx < 3:
+                    snippet = text[idx + len(tag):].strip()
+                    snippet = re.split(r"(?<=\.)\s", snippet, maxsplit=3)
+                    snippet = " ".join(snippet[:3])
+                else:
+                    snippet = text[start:idx].strip()
+                snippet = re.sub(r"\s*\[[^\]]+\]\s*", " ", snippet).strip().rstrip(".")
+                out[r] = snippet[:320]
+                break
+    return out
+
+
+ACTION_MEANING = {
+    "settle_invoice": "the invoice is valid, reconciled, not previously paid and within autonomous authority, so it can be settled",
+    "request_approval": "the invoice is commercially valid but its total is outside delegated authority, so a named approver must release it",
+    "hold_invoice": "payment must pause until the stated verification is completed",
+    "reject_duplicate": "the same commercial invoice has already been paid, so a second payment must be rejected",
+    "open_exception": "the controlling records materially conflict, so the case must go to the exception workflow",
+}
+
+
+def build_rationale(action: str, reason: str, refs: list, support: dict | None = None) -> str:
+    support = support or {}
+    parts = [f"Action {action}: {ACTION_MEANING.get(action, '')}."]
+    for r in refs:
+        snip = support.get(r)
+        parts.append(f"[{r}] {snip}." if snip else f"[{r}] supports this.")
+    reason = re.sub(r"\s+", " ", (reason or "").strip())
+    if reason:
+        parts.append(reason if reason.endswith(".") else reason + ".")
+    text = " ".join(parts)
+    if len(text) > 1500:
+        text = " ".join(parts[:1 + len(refs)])[:1500]
+    return text
+
+
+def _old_build_rationale(action: str, reason: str, refs: list) -> str:
     reason = re.sub(r"\s+", " ", (reason or "").strip())
     cited = ", ".join(f"[{r}]" for r in refs) if refs else "the package documents"
     text = (f"Action {action}: {reason} " if reason else f"Action {action} is required by the decisive record. ")
@@ -411,7 +463,16 @@ def finalize(seg: Segmented, pkg: dict, raw: dict, source: str) -> dict:
     action = str(raw.get("action", "")).strip()
     if action not in ACTIONS:
         raise ValueError(f"bad action {action!r}")
-    refs = choose_refs(seg, raw.get("decisiveParagraph"), raw.get("evidenceRefs"))
+    det_refs, det_paras = decisive_refs(seg)
+    refs = det_refs or choose_refs(seg, raw.get("decisiveParagraph"), raw.get("evidenceRefs"))
+    reason_text = str(raw.get("reason") or raw.get("rationale") or "")
+    if det_paras and source == "llm":
+        rule_action = classify_text("\n".join(p["text"] for p in det_paras))
+        if rule_action != action and rule_action != "settle_invoice":
+            log.warning("rules override model: %s -> %s", action, rule_action)
+            action = rule_action
+            reason_text = ""
+            source = "llm+rules"
     currency = str(raw.get("currency") or "").strip().upper()[:3]
     sf = structured_facts(pkg)
     vendor = str(raw.get("vendorName") or sf.get("vendorName") or "").strip()
@@ -431,15 +492,126 @@ def finalize(seg: Segmented, pkg: dict, raw: dict, source: str) -> dict:
             minor = int(am.strip())
     if minor is None:
         minor = 0
+    df = doc_facts(seg)
+    if df.get("vendorName"):
+        vendor = df["vendorName"]
+    if df.get("invoiceNumber"):
+        inv = df["invoiceNumber"]
+    if df.get("currency"):
+        currency = df["currency"]
+    if df.get("amount"):
+        m2 = amount_to_minor(df["amount"], currency)
+        if m2 is not None:
+            minor = m2
+    if inv and not _present(inv, seg.text):
+        inv = ""  # never return an identifier that is not in the documents
     return {
         "action": action,
         "facts": {"vendorName": vendor, "invoiceNumber": inv, "amountMinor": minor,
                   "currency": currency or "INR"},
         "refs": refs,
-        "reason": str(raw.get("reason") or raw.get("rationale") or ""),
+        "reason": reason_text,
+        "support": evidence_snippets(seg, refs),
         "source": source,
     }
 
+
+
+# ---------------------------------------------------------------- deterministic evidence & facts
+REF_DECOY_RE = re.compile(
+    r"archive|archived|training|previous quarter|expired|historical|closed reconciliation|"
+    r"separate supplier|unrelated|hypothetical|cover sheet|not this vendor|govern no live case|"
+    r"vocabulary|non-operative|superseded|illustrat|example", re.I)
+COVER_FACTS_RE = re.compile(
+    r"Supplier (?P<v>.+?); invoice (?P<i>[^\s;]+); stated total (?P<c>[A-Z]{3}) (?P<a>[\d][\d,]*(?:\.\d+)?)")
+INSTRUMENT_RE = re.compile(
+    r"(?:Signed )?commercial instrument (?P<i>[A-Z][A-Z0-9/_.-]*\d[A-Z0-9/_.-]*) covers order (?P<o>[\w-]+),"
+    r"(?: payee (?P<p>[\w-]+))? and (?P<c>[A-Z]{3}) (?P<a>\d[\d,]*(?:\.\d+)?)", re.I)
+LEDGER_RE = re.compile(
+    r"disbursement for (?P<c>[A-Z]{3}) (?P<a>\d[\d,]*(?:\.\d+)?) to (?P<v>.+?) previously settled order "
+    r"(?P<o1>[\w-]+)\. The currently submitted order is (?P<o2>[\w-]+)", re.I)
+ORDER_TOTAL_RE = re.compile(r"submitted invoice total is (?P<c>[A-Z]{3}) (?P<a>\d[\d,]*(?:\.\d+)?)", re.I)
+
+
+def _is_decoy_para(p) -> bool:
+    return bool(REF_DECOY_RE.search(p["text"]))
+
+
+def decisive_refs(seg: "Segmented"):
+    """Return (refs, paragraphs) when the evidence can be identified without the model."""
+    multi = [p for p in seg.paras if len(p["refs"]) >= 3 and not _is_decoy_para(p)]
+    if len(multi) == 1 and len(multi[0]["refs"]) == 3:
+        return list(multi[0]["refs"]), multi
+    if not multi:
+        single = [p for p in seg.paras if len(p["refs"]) == 1 and not _is_decoy_para(p)]
+        if len(single) == 3:
+            return [p["refs"][0] for p in single], single
+    return None, None
+
+
+def doc_facts(seg: "Segmented") -> dict:
+    text = seg.text
+    out = {}
+    m = COVER_FACTS_RE.search(text)
+    if m:
+        out = {"vendorName": m.group("v").strip(), "invoiceNumber": m.group("i").strip().rstrip("."),
+               "currency": m.group("c"), "amount": m.group("a")}
+        return out
+    m = INSTRUMENT_RE.search(text)
+    if m:
+        out.update({"invoiceNumber": m.group("i").rstrip("."), "currency": m.group("c").upper(),
+                    "amount": m.group("a")})
+    led = LEDGER_RE.search(text)
+    if led:
+        out.setdefault("vendorName", led.group("v").strip())
+    if "amount" not in out:
+        m = ORDER_TOTAL_RE.search(text)
+        if m:
+            out.update({"currency": m.group("c").upper(), "amount": m.group("a")})
+    return out
+
+
+def classify_text(text: str):
+    """Rule classifier for a decisive passage (used when the model is unavailable)."""
+    t = re.sub(r"\[[^\]]+\]", "", text)
+    # Generic policy wording lists every control; it never decides a case by itself.
+    t = re.sub(r"Payment controls:[^\n]*?Otherwise follow the delegation limit\.?", " ", t, flags=re.I)
+    t = re.sub(r"Payment controls:[^\n]*", " ", t, flags=re.I)
+    led = LEDGER_RE.search(t)
+    if led and led.group("o1").lower() == led.group("o2").lower():
+        return "reject_duplicate"
+    if re.search(r"earlier posting for the same|same commercial key|earlier settled entry|second disbursement|"
+                 r"exact commercial duplicate|already (been )?(paid|discharged|settled)|another scan of the same", t, re.I) \
+            and not re.search(r"\bno (earlier|prior) (posting|settlement)|no paid item", t, re.I):
+        return "reject_duplicate"
+    if re.search(r"outside the permitted reconciliation tolerance|conflicts with|does not reconcile|incompatible|"
+                 r"contradict|exception (queue|case|workflow)|documented exception", t, re.I):
+        return "open_exception"
+    m = re.search(r"Order [\w-]+ is signed for [A-Z]{3} (\d[\d,]*(?:\.\d+)?).*?submitted invoice total is [A-Z]{3} (\d[\d,]*(?:\.\d+)?)", t, re.I | re.S)
+    if m and abs(float(m.group(1).replace(",", "")) - float(m.group(2).replace(",", ""))) > 0.5:
+        return "open_exception"
+    if re.search(r"(callback|call-back|known-channel|out-of-band|pre-existing contact)[^.]*"
+                 r"(not completed|has not|neither confirmed|incomplete|pending|until)", t, re.I) or \
+            re.search(r"(beneficiary details|destination-account change|newly supplied bank account|"
+                      r"pauses release|freezes payment)", t, re.I):
+        if not re.search(r"callback[^.]*\bconfirmed\b(?! nor)", t, re.I):
+            return "hold_invoice"
+    vm = re.search(r"Vendor master lists account ([\w-]+)\. Remittance instructions now specify ([\w-]+)", t, re.I)
+    if vm and vm.group(1) != vm.group(2) and not re.search(r"callback[^.]*\bconfirmed\b(?! nor)", t, re.I):
+        return "hold_invoice"
+    if re.search(r"outside the operator's|delegation ceiling|exceeds this queue|without escalation only up to|"
+                 r"financial-approval|named financial approver", t, re.I):
+        return "request_approval"
+    ceil = re.search(r"autonomous payment ceiling for [A-Z]{3} is [A-Z]{3} (\d[\d,]*(?:\.\d+)?)", t, re.I)
+    tot = ORDER_TOTAL_RE.search(t) or INSTRUMENT_RE.search(t)
+    if ceil and tot:
+        if float(tot.group("a").replace(",", "")) > float(ceil.group(1).replace(",", "")):
+            return "request_approval"
+    return "settle_invoice"
+
+
+def _present(value: str, text: str) -> bool:
+    return bool(value) and value.lower() in text.lower()
 
 # ---------------------------------------------------------------- heuristic fallback
 PATTERNS = [
@@ -468,6 +640,16 @@ def text_facts(text: str) -> dict:
 
 
 def heuristic(seg: Segmented, pkg: dict) -> dict:
+    refs, paras = decisive_refs(seg)
+    if paras:
+        action = classify_text("\n".join(p["text"] for p in paras))
+        raw = {"action": action, "evidenceRefs": refs,
+               "reason": "Read together, these current-case records determine the action under the payment controls."}
+        return finalize(seg, pkg, raw, "rules")
+    return legacy_heuristic(seg, pkg)
+
+
+def legacy_heuristic(seg: Segmented, pkg: dict) -> dict:
     best = None
     for p in seg.paras:
         ctx = p["path"] + " " + p["text"]
@@ -626,5 +808,5 @@ def to_proposal(pid: str, action_id: str, dec: dict) -> dict:
         "action": dec["action"],
         "facts": dict(dec["facts"]),
         "evidenceRefs": refs,
-        "rationale": build_rationale(dec["action"], dec.get("reason", ""), dec["refs"]),
+        "rationale": build_rationale(dec["action"], dec.get("reason", ""), dec["refs"], dec.get("support")),
     }
