@@ -194,9 +194,23 @@ def _extract_json(text: str):
     return json.loads(text)
 
 
-async def call_llm(system: str, user: str) -> dict:
+_sem: asyncio.Semaphore | None = None
+LAST_LLM_ERROR = {"error": None}
+
+
+def sem() -> asyncio.Semaphore:
+    global _sem
+    if _sem is None:
+        _sem = asyncio.Semaphore(int(os.environ.get("LLM_CONCURRENCY", "4")))
+    return _sem
+
+
+async def call_llm(system: str, user: str, deadline: float | None = None) -> dict:
+    """Call the model; retry rate limits, 5xx and timeouts while time remains."""
     if not LLM_API_KEY:
         raise RuntimeError("LLM_API_KEY not configured")
+    loop = asyncio.get_running_loop()
+    deadline = deadline or (loop.time() + DECIDE_BUDGET)
     url = f"{LLM_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     base = {"model": LLM_MODEL,
@@ -204,17 +218,54 @@ async def call_llm(system: str, user: str) -> dict:
     variants = [dict(base, temperature=0, response_format={"type": "json_object"}),
                 dict(base, response_format={"type": "json_object"}),
                 dict(base)]
-    last = None
-    for body in variants:
-        r = await client().post(url, headers=headers, json=body)
+    vi, attempt, last = 0, 0, None
+    while vi < len(variants):
+        remaining = deadline - loop.time()
+        if remaining < 4:
+            break
+        attempt += 1
+        try:
+            async with sem():
+                remaining = deadline - loop.time()
+                if remaining < 4:
+                    break
+                r = await client().post(url, headers=headers, json=variants[vi],
+                                        timeout=min(LLM_TIMEOUT, remaining - 1))
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last = RuntimeError(f"LLM transport error: {e!r}")
+            log.warning("%s", last)
+            await asyncio.sleep(min(1.0 * attempt, max(0, deadline - loop.time() - 5)))
+            continue
         if r.status_code == 400:
             last = RuntimeError(f"LLM 400: {r.text[:300]}")
+            log.warning("%s", last)
+            vi += 1
             continue
-        r.raise_for_status()
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        return _extract_json(content)
-    raise last or RuntimeError("LLM failed")
+        if r.status_code in (408, 409, 425, 429) or r.status_code >= 500:
+            last = RuntimeError(f"LLM {r.status_code}: {r.text[:300]}")
+            log.warning("%s", last)
+            LAST_LLM_ERROR["error"] = str(last)
+            try:
+                ra = float(r.headers.get("retry-after", "0"))
+            except ValueError:
+                ra = 0
+            await asyncio.sleep(min(max(ra, 1.5 * attempt), 6, max(0, deadline - loop.time() - 5)))
+            continue
+        if r.status_code >= 300:
+            last = RuntimeError(f"LLM {r.status_code}: {r.text[:300]}")
+            log.warning("%s", last)
+            LAST_LLM_ERROR["error"] = str(last)
+            raise last
+        try:
+            content = r.json()["choices"][0]["message"]["content"]
+            return _extract_json(content)
+        except Exception as e:  # noqa: BLE001
+            last = RuntimeError(f"LLM bad output: {e!r}")
+            log.warning("%s", last)
+            await asyncio.sleep(0.5)
+            continue
+    LAST_LLM_ERROR["error"] = str(last)
+    raise last or RuntimeError("LLM failed: out of time")
 
 
 # ---------------------------------------------------------------- validation
@@ -402,7 +453,7 @@ def heuristic(seg: Segmented, pkg: dict) -> dict:
                 break
     if best is None:
         cand = [p for p in seg.paras if not COVER_RE.search(p["path"])] or seg.paras
-        action, para = "settle_invoice", (cand[0] if cand else None)
+        action, para = "request_approval", (cand[0] if cand else None)
     else:
         action, para = best[1], best[2]
     sf = structured_facts(pkg)
@@ -423,12 +474,12 @@ def heuristic(seg: Segmented, pkg: dict) -> dict:
 _inflight: dict[str, asyncio.Future] = {}
 
 
-async def _decide_chunk(batch, chunk, store, futures):
+async def _decide_chunk(batch, chunk, store, futures, deadline=None):
     """chunk: list of (key, pid, pkg, seg)."""
     results = {}
     try:
         user = build_user_prompt(batch, [(pid, seg) for _, pid, _, seg in chunk])
-        out = await call_llm(SYSTEM_PROMPT, user)
+        out = await call_llm(SYSTEM_PROMPT, user, deadline)
         decs = out.get("decisions") if isinstance(out, dict) else None
         if not isinstance(decs, list):
             raise ValueError("no decisions list")
@@ -478,7 +529,8 @@ async def decide_batch(batch: dict, store) -> dict:
             futures[key] = fut
             waits[pid] = fut
             todo.append((key, pid, pkg, seg))
-    jobs = [asyncio.create_task(_decide_chunk(batch, todo[i:i + LLM_CHUNK], store, futures))
+    deadline = loop.time() + DECIDE_BUDGET - 1
+    jobs = [asyncio.create_task(_decide_chunk(batch, todo[i:i + LLM_CHUNK], store, futures, deadline))
             for i in range(0, len(todo), LLM_CHUNK)]
     try:
         if jobs:

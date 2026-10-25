@@ -491,6 +491,8 @@ def admin(request: Request, path: str) -> Response:
         limit = int(request.query_params.get("limit") or 20)
         return a2a_response(store.recent_inbound(limit, request.query_params.get("kind")),
                             media="application/json")
+    if path == "/admin/llm":
+        return None  # handled async in dispatch
     if path == "/admin/clear-decisions" and request.method == "POST":
         store.clear_decisions()
         return a2a_response({"ok": True}, media="application/json")
@@ -515,6 +517,23 @@ async def dispatch(request: Request) -> Response:
         if path in ("/", "/healthz") and method == "GET":
             return a2a_response({"status": "ok", "agentCard": "/.well-known/agent-card.json",
                                  "base": BASE_PATH + "/"}, media="application/json")
+        if path.rstrip("/") == "/admin/llm":
+            key = request.query_params.get("key") or request.headers.get("x-admin-key")
+            if not ADMIN_TOKEN or key != ADMIN_TOKEN:
+                return Response(b'{"error":"not found"}', 404, media_type="application/json")
+            import decide as _d
+            info = {"model": _d.LLM_MODEL, "baseUrl": _d.LLM_BASE_URL, "keySet": bool(_d.LLM_API_KEY),
+                    "lastError": _d.LAST_LLM_ERROR["error"]}
+            try:
+                loop = asyncio.get_running_loop()
+                out = await _d.call_llm("Reply with JSON only.", 'Return {"ok": true}',
+                                        loop.time() + 30)
+                info["test"] = "OK"
+                info["reply"] = out
+            except Exception as e:  # noqa: BLE001
+                info["test"] = "FAILED"
+                info["error"] = str(e)[:500]
+            return a2a_response(info, media="application/json")
         if path.startswith("/admin/"):
             return admin(request, path.rstrip("/"))
 
