@@ -223,7 +223,9 @@ async def call_llm(system: str, user: str, deadline: float | None = None) -> dic
                 dict(base, response_format={"type": "json_object"}, **extra),
                 dict(base, **extra),
                 dict(base)]
-    vi, attempt, last = 0, 0, None
+    models = [LLM_MODEL] + [m.strip() for m in os.environ.get("LLM_FALLBACK_MODELS", "").split(",")
+                            if m.strip() and m.strip() != LLM_MODEL]
+    mi, vi, attempt, last = 0, 0, 0, None
     while vi < len(variants):
         remaining = deadline - loop.time()
         if remaining < 4:
@@ -234,7 +236,7 @@ async def call_llm(system: str, user: str, deadline: float | None = None) -> dic
                 remaining = deadline - loop.time()
                 if remaining < 4:
                     break
-                r = await client().post(url, headers=headers, json=variants[vi],
+                r = await client().post(url, headers=headers, json=dict(variants[vi], model=models[mi % len(models)]),
                                         timeout=min(LLM_TIMEOUT, remaining - 1))
         except (httpx.TimeoutException, httpx.TransportError) as e:
             last = RuntimeError(f"LLM transport error: {e!r}")
@@ -246,8 +248,14 @@ async def call_llm(system: str, user: str, deadline: float | None = None) -> dic
             log.warning("%s", last)
             vi += 1
             continue
+        if r.status_code == 404 and mi + 1 < len(models):
+            last = RuntimeError(f"LLM 404 for {models[mi]}: {r.text[:200]}")
+            log.warning("%s", last)
+            mi += 1
+            continue
         if r.status_code in (408, 409, 425, 429) or r.status_code >= 500:
-            last = RuntimeError(f"LLM {r.status_code}: {r.text[:300]}")
+            last = RuntimeError(f"LLM {r.status_code} ({models[mi % len(models)]}): {r.text[:300]}")
+            mi += 1  # rotate to the next model, if any
             log.warning("%s", last)
             LAST_LLM_ERROR["error"] = str(last)
             try:
